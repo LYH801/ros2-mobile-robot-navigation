@@ -92,9 +92,10 @@ static inline double quaternionToYaw(
     return std::atan2(siny_cosp, cosy_cosp);
 }
 
+// 请将入参 velocity 前面的注释 /*velocity*/ 去掉，正式使用它！
 geometry_msgs::msg::TwistStamped PursuitController::computeVelocityCommands(
     const geometry_msgs::msg::PoseStamped& pose,
-    const geometry_msgs::msg::Twist& /*velocity*/,
+    const geometry_msgs::msg::Twist& velocity, // 修改点：去掉注释
     nav2_core::GoalChecker* /*goal_checker*/)
 {
     geometry_msgs::msg::TwistStamped cmd_vel;
@@ -102,45 +103,29 @@ geometry_msgs::msg::TwistStamped PursuitController::computeVelocityCommands(
     cmd_vel.header.stamp = node_->now();
 
     if (global_plan_.poses.empty() || global_plan_.poses.size() < 2) {
-        cmd_vel.twist.linear.x = 0.0;
-        cmd_vel.twist.angular.z = 0.0;
-        return cmd_vel;
-    }
-    
-    // 检查 pose 是否有效（frame_id 必须是 map 或 global_frame）
-    if (pose.header.frame_id != global_frame_) {
-        RCLCPP_WARN_THROTTLE(
-            node_->get_logger(), *node_->get_clock(), 2000,
-            "Pursuit: pose frame_id is '%s', expected '%s'. Stopping.",
-            pose.header.frame_id.c_str(), global_frame_.c_str());
-        cmd_vel.twist.linear.x = 0.0;
-        cmd_vel.twist.angular.z = 0.0;
-        return cmd_vel;
+        cmd_vel.twist.linear.x = 0.0; cmd_vel.twist.angular.z = 0.0; return cmd_vel;
     }
 
     double robot_x = pose.pose.position.x;
     double robot_y = pose.pose.position.y;
     double robot_yaw = quaternionToYaw(pose.pose.orientation);
 
-    // ========== 步骤 1：找路径上离机器人最近的点 ==========
     size_t closest_idx = 0;
     double min_dist_sq = std::numeric_limits<double>::max();
     for (size_t i = 0; i < global_plan_.poses.size(); ++i) {
         double dx = global_plan_.poses[i].pose.position.x - robot_x;
         double dy = global_plan_.poses[i].pose.position.y - robot_y;
         double d_sq = dx * dx + dy * dy;
-        if (d_sq < min_dist_sq) {
-            min_dist_sq = d_sq;
-            closest_idx = i;
-        }
+        if (d_sq < min_dist_sq) { min_dist_sq = d_sq; closest_idx = i; }
     }
 
-    // ========== 步骤 2：从最近点向前找预瞄点 ==========
+    // 【修改点：真正的动态预瞄】
     double lookahead = min_lookahead_dist_;
     if (use_velocity_scaled_lookahead_) {
-        lookahead = max_linear_speed_ * lookahead_time_;
-        lookahead = std::clamp(lookahead,
-                               min_lookahead_dist_, max_lookahead_dist_);
+        // 使用机器人当前的实际线速度来计算预瞄，而不是最大速度
+        double current_v = std::abs(velocity.linear.x); 
+        lookahead = current_v * lookahead_time_;
+        lookahead = std::clamp(lookahead, min_lookahead_dist_, max_lookahead_dist_);
     }
 
     double accumulated = 0.0;
@@ -149,79 +134,55 @@ geometry_msgs::msg::TwistStamped PursuitController::computeVelocityCommands(
     bool found = false;
 
     for (size_t i = closest_idx + 1; i < global_plan_.poses.size(); ++i) {
-        double px0 = global_plan_.poses[i-1].pose.position.x;
-        double py0 = global_plan_.poses[i-1].pose.position.y;
-        double px1 = global_plan_.poses[i].pose.position.x;
-        double py1 = global_plan_.poses[i].pose.position.y;
-        double dx = px1 - px0;
-        double dy = py1 - py0;
-        double seg_len = std::sqrt(dx * dx + dy * dy);
-        accumulated += seg_len;
-
+        double dx = global_plan_.poses[i].pose.position.x - global_plan_.poses[i-1].pose.position.x;
+        double dy = global_plan_.poses[i].pose.position.y - global_plan_.poses[i-1].pose.position.y;
+        accumulated += std::sqrt(dx * dx + dy * dy);
         if (accumulated >= lookahead) {
-            lookahead_x = px1;
-            lookahead_y = py1;
-            found = true;
-            break;
+            lookahead_x = global_plan_.poses[i].pose.position.x;
+            lookahead_y = global_plan_.poses[i].pose.position.y;
+            found = true; break;
         }
     }
 
     if (!found) {
-        // 路径剩余部分不足 lookahead，用终点
         lookahead_x = global_plan_.poses.back().pose.position.x;
         lookahead_y = global_plan_.poses.back().pose.position.y;
     }
 
-    // ========== 步骤 3：把预瞄点转到机器人坐标系 ==========
     double dx = lookahead_x - robot_x;
     double dy = lookahead_y - robot_y;
-
     double cos_yaw = std::cos(-robot_yaw);
     double sin_yaw = std::sin(-robot_yaw);
 
     double local_x = dx * cos_yaw - dy * sin_yaw;
     double local_y = dx * sin_yaw + dy * cos_yaw;
 
-    // 预瞄点在身后，原地转（选最近的方向）
     if (local_x < 0.0) {
         cmd_vel.twist.linear.x = 0.0;
-        double omega = (local_y > 0.0 ? 1.0 : -1.0) * max_angular_speed_ * 0.5;
-        cmd_vel.twist.angular.z = omega;
+        cmd_vel.twist.angular.z = (local_y > 0.0 ? 1.0 : -1.0) * max_angular_speed_ * 0.5;
         return cmd_vel;
     }
 
-    // ========== 步骤 4：Pure Pursuit 曲率计算 ==========
     double Ld_sq = local_x * local_x + local_y * local_y;
     double Ld = std::sqrt(Ld_sq);
     if (Ld < 1e-3) Ld = 1e-3;
 
     double kappa = 2.0 * local_y / Ld_sq;
     double omega = max_linear_speed_ * kappa;
-
-    // 限制角速度
     omega = std::clamp(omega, -max_angular_speed_, max_angular_speed_);
 
-    // ========== 步骤 5：接近目标时减速 ==========
     double goal_x = global_plan_.poses.back().pose.position.x;
     double goal_y = global_plan_.poses.back().pose.position.y;
-    double dist_to_goal = std::sqrt(
-        (goal_x - robot_x) * (goal_x - robot_x) +
-        (goal_y - robot_y) * (goal_y - robot_y));
+    double dist_to_goal = std::sqrt((goal_x - robot_x) * (goal_x - robot_x) + (goal_y - robot_y) * (goal_y - robot_y));
 
     double v = max_linear_speed_;
     if (dist_to_goal < 0.5) {
-        v = std::max(min_linear_speed_,
-                     max_linear_speed_ * dist_to_goal / 0.5);
+        v = std::max(min_linear_speed_, max_linear_speed_ * dist_to_goal / 0.5);
     }
-
-    // 角速度过大时降线速度
-    if (std::abs(omega) > 0.5 * max_angular_speed_) {
-        v *= 0.5;
-    }
+    if (std::abs(omega) > 0.5 * max_angular_speed_) v *= 0.5;
 
     cmd_vel.twist.linear.x = v;
     cmd_vel.twist.angular.z = omega;
-
     return cmd_vel;
 }
 

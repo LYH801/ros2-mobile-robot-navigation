@@ -136,12 +136,21 @@ class MissionManager(Node):
         state = msg.data
         self.get_logger().info(f'停靠状态: {state}')
 
-        if state == 'DOCKED' and self.state == MissionState.DOCKING:
+        if self.state != MissionState.DOCKING:
+            return
+
+        if state == 'DOCKED':
             self.get_logger().info('视觉停靠完成')
             self.transition(MissionState.COMPLETED)
-        elif state == 'IDLE' and self.state == MissionState.DOCKING:
-            if time.time() - self.state_enter_time > 5.0:
-                self.get_logger().error('视觉停靠失败')
+            
+        elif state == 'FAILED_SAFETY':
+            self.get_logger().error('视觉停靠触发安全保护，判定为失败')
+            self.transition(MissionState.FAILED)
+            
+        elif state == 'IDLE':
+            # 只有当视觉节点突然意外退回 IDLE，且已经过了足够时间，才判为失败
+            if time.time() - self.state_enter_time > 3.0:
+                self.get_logger().error('视觉节点意外挂起或超时回退')
                 self.transition(MissionState.FAILED)
 
     def check_timeout(self):
